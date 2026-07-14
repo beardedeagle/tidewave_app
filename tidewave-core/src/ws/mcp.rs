@@ -41,9 +41,11 @@ pub struct McpChannelState {
     /// Registry mapping session_id to the current channel for that session.
     pub sessions: Arc<DashMap<String, McpSession>>,
     /// Pending responses waiting for answers from the browser
-    pub awaiting_answers: Arc<DashMap<(String, ChannelId, Value), oneshot::Sender<Value>>>,
+    pub awaiting_answers: Arc<DashMap<(String, ChannelId, Value), AwaitingAnswer>>,
     /// Monotonic channel id generator for distinguishing reconnect ownership.
     pub next_channel_id: Arc<AtomicU64>,
+    /// Monotonic proxy ID generator for correlating browser responses.
+    next_proxy_id: Arc<AtomicU64>,
 }
 
 pub type ChannelId = u64;
@@ -54,12 +56,29 @@ pub struct McpSession {
     pub sender: ChannelSender,
 }
 
+pub struct AwaitingAnswer {
+    client_id: Value,
+    response_tx: oneshot::Sender<Value>,
+}
+
+struct PendingAnswerCleanup {
+    awaiting_answers: Arc<DashMap<(String, ChannelId, Value), AwaitingAnswer>>,
+    key: (String, ChannelId, Value),
+}
+
+impl Drop for PendingAnswerCleanup {
+    fn drop(&mut self) {
+        self.awaiting_answers.remove(&self.key);
+    }
+}
+
 impl McpChannelState {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(DashMap::new()),
             awaiting_answers: Arc::new(DashMap::new()),
             next_channel_id: Arc::new(AtomicU64::new(1)),
+            next_proxy_id: Arc::new(AtomicU64::new(1)),
         }
     }
 }
@@ -122,11 +141,17 @@ pub async fn init(
                 if phx_msg.event == "mcp_message" {
                     let json_rpc_message = phx_msg.payload.into_json();
 
-                    // Check if this is a reply to a pending request
-                    if let Some(id) = json_rpc_message.get("id") {
+                    // Only responses can complete a pending request. Browser-originated
+                    // JSON-RPC requests also have IDs and must not consume an entry with a
+                    // coincidentally matching proxy ID.
+                    if let Some(id) = json_rpc_response_id(&json_rpc_message) {
                         let key = (session_id.clone(), channel_id, id.clone());
-                        if let Some((_, response_tx)) = state.awaiting_answers.remove(&key) {
-                            if response_tx.send(json_rpc_message.clone()).is_err() {
+                        if let Some((_, answer)) = state.awaiting_answers.remove(&key) {
+                            let mut client_response = json_rpc_message.clone();
+                            if let Some(response) = client_response.as_object_mut() {
+                                response.insert("id".to_string(), answer.client_id);
+                            }
+                            if answer.response_tx.send(client_response).is_err() {
                                 warn!("Failed to send response to waiting request");
                             }
                             continue;
@@ -204,9 +229,10 @@ pub async fn mcp_channel_client_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let mut pending_key = None;
+    let mut pending_cleanup = None;
     let mut response_rx = None;
     let mut failed_channel_id = None;
+    let mut browser_message = json_rpc_message.clone();
 
     {
         // Keep the session entry borrowed until after the send. This prevents a
@@ -221,25 +247,39 @@ pub async fn mcp_channel_client_handler(
             }
         };
 
-        // Create response channel if this is a request (has "id")
-        if let Some(id) = json_rpc_message.get("id") {
-            let key = (session_id.clone(), session.channel_id, id.clone());
+        // Only requests receive responses. Notifications and responses are forwarded
+        // without installing a pending answer.
+        if let Some(id) = json_rpc_request_id(&json_rpc_message) {
+            let proxy_id = Value::String(format!(
+                "tw-app-{}",
+                state.next_proxy_id.fetch_add(1, Ordering::SeqCst)
+            ));
+            let key = (session_id.clone(), session.channel_id, proxy_id.clone());
             let (tx, rx) = oneshot::channel();
-            state.awaiting_answers.insert(key.clone(), tx);
-            pending_key = Some(key);
+            state.awaiting_answers.insert(
+                key.clone(),
+                AwaitingAnswer {
+                    client_id: id.clone(),
+                    response_tx: tx,
+                },
+            );
+            pending_cleanup = Some(PendingAnswerCleanup {
+                awaiting_answers: state.awaiting_answers.clone(),
+                key,
+            });
             response_rx = Some(rx);
+            if let Some(message) = browser_message.as_object_mut() {
+                message.insert("id".to_string(), proxy_id);
+            }
         }
 
         // Push the message directly to the browser
-        if try_push_mcp_message(&session, json_rpc_message.clone()).is_err() {
+        if try_push_mcp_message(&session, browser_message).is_err() {
             failed_channel_id = Some(session.channel_id);
         }
     }
 
     if let Some(channel_id) = failed_channel_id {
-        if let Some(key) = &pending_key {
-            state.awaiting_answers.remove(key);
-        }
         state
             .sessions
             .remove_if(&session_id, |_, current| current.channel_id == channel_id);
@@ -248,7 +288,7 @@ pub async fn mcp_channel_client_handler(
 
     // If this is a request, wait for the response and return JSON
     if let Some(response_rx) = response_rx {
-        match response_rx.await {
+        let result = match response_rx.await {
             Ok(response) => {
                 debug!("Got response: {:?}", response);
                 Ok(Json(response).into_response())
@@ -257,7 +297,9 @@ pub async fn mcp_channel_client_handler(
                 error!("Response channel closed unexpectedly");
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
-        }
+        };
+        drop(pending_cleanup);
+        result
     } else {
         // This is a notification or response - return HTTP 202 Accepted with no body
         Ok(Response::builder()
@@ -284,6 +326,21 @@ fn try_push_mcp_message(session: &McpSession, payload: Value) -> Result<(), Send
     session.sender.tx.send(phx)
 }
 
+fn json_rpc_request_id(message: &Value) -> Option<&Value> {
+    message.get("method").and_then(|_| message.get("id"))
+}
+
+fn json_rpc_response_id(message: &Value) -> Option<&Value> {
+    let has_result = message.get("result").is_some();
+    let has_error = message.get("error").is_some();
+
+    if message.get("method").is_none() && has_result != has_error {
+        message.get("id")
+    } else {
+        None
+    }
+}
+
 fn cleanup_pending_answers(
     state: &McpChannelState,
     session_id: &str,
@@ -298,8 +355,15 @@ fn cleanup_pending_answers(
         .collect();
 
     for key in keys_to_remove {
-        if let Some((_, tx)) = state.awaiting_answers.remove(&key) {
-            let _ = tx.send(response.clone());
+        if let Some((_, answer)) = state.awaiting_answers.remove(&key) {
+            let mut client_response = response.clone();
+            if let Some(response) = client_response.as_object_mut() {
+                response
+                    .entry("jsonrpc".to_string())
+                    .or_insert_with(|| Value::String("2.0".to_string()));
+                response.insert("id".to_string(), answer.client_id);
+            }
+            let _ = answer.response_tx.send(client_response);
         }
     }
 }
